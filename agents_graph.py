@@ -1,4 +1,5 @@
-from typing import Annotated, Literal
+from typing import Annotated, Literal, TypedDict
+from typing_extensions import NotRequired
 from botocore.config import Config
 from langchain.chat_models import init_chat_model
 from langchain_community.agent_toolkits import FileManagementToolkit
@@ -10,10 +11,15 @@ from langchain_core.messages import (
     ToolMessage, 
     HumanMessage
 )
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt
+from langfuse import get_client, Langfuse
 from langfuse.langchain import CallbackHandler
+
+# Langfuse clientを取得
+langfuse = get_client()
 
 # 環境変数のロード
 from dotenv import load_dotenv
@@ -64,21 +70,35 @@ system_prompt = """
 
 
 # ========== Graph ノードの定義 ==========
-def agent_node(state: MessagesState) -> dict:
+# カスタムStateを定義（trace_idを追加）
+class AgentState(MessagesState):
+    trace_id: NotRequired[str]
+
+
+def agent_node(state: AgentState) -> dict:
     """LLMを呼び出してツール呼び出しを決定するノード"""
     print(f"[Agent Node] メッセージ数: {len(state['messages'])}")
+    print(f"[Agent Node] trace_id: {state.get('trace_id')}")
     
-    # Langfuse tracing
-    langfuse_handler = CallbackHandler()
+    # trace_idを取得（初回はNoneの可能性あり）
+    trace_id = state.get("trace_id")
     
     # システムプロンプトを先頭に追加
     messages = [SystemMessage(content=system_prompt)] + state["messages"]
     
+    # CallbackHandlerを初期化
+    langfuse_handler = CallbackHandler()
+    
+    # RunnableConfigを作成
+    config = RunnableConfig(callbacks=[langfuse_handler])
+    if trace_id:
+        config["metadata"] = { 
+            "langfuse_session_id": trace_id,
+            "langfuse_tags": ["random-tag-1", "random-tag-2"]
+        }
+    
     # LLM呼び出し
-    response = llm_with_tools.invoke(
-        messages,
-        config={"callbacks": [langfuse_handler]}
-    )
+    response = llm_with_tools.invoke(messages, config=config)
     
     print(f"[Agent Node] Tool calls: {len(response.tool_calls) if response.tool_calls else 0}")
     
@@ -86,17 +106,27 @@ def agent_node(state: MessagesState) -> dict:
     return {"messages": [response]}
 
 
-def human_approval_node(state: MessagesState) -> dict:
+def human_approval_node(state: AgentState) -> dict:
     """ツール実行前に人間の承認を求め、ツールを実行するノード"""
     last_message = state["messages"][-1]
+    
+    print(f"[Human Approval Node] trace_id: {state.get('trace_id')}")
     
     if not isinstance(last_message, AIMessage) or not last_message.tool_calls:
         return {"messages": []}
     
+    tool_messages = _execute_tools_with_approval(last_message.tool_calls)
+    
+    # すべてのツール結果を返す
+    return {"messages": tool_messages}
+
+
+def _execute_tools_with_approval(tool_calls):
+    """ツールの承認と実行を行う内部関数"""
     tool_messages = []
     
     # 各ツール呼び出しに対して承認を求める
-    for tool_call in last_message.tool_calls:
+    for tool_call in tool_calls:
         tool_name = tool_call["name"]
         tool_args = tool_call["args"]
         tool_data = {"name": tool_name}
@@ -141,11 +171,10 @@ def human_approval_node(state: MessagesState) -> dict:
                 )
             )
     
-    # すべてのツール結果を返す
-    return {"messages": tool_messages}
+    return tool_messages
 
 
-def should_continue(state: MessagesState) -> Literal["human_approval", "end"]:
+def should_continue(state: AgentState) -> Literal["human_approval", "end"]:
     """次のノードを決定するルーティング関数"""
     last_message = state["messages"][-1]
     
@@ -159,7 +188,7 @@ def should_continue(state: MessagesState) -> Literal["human_approval", "end"]:
 
 # ========== Graph の構築 ==========
 # グラフの作成
-workflow = StateGraph(MessagesState)
+workflow = StateGraph(AgentState)
 
 # ノードの追加
 workflow.add_node("agent", agent_node)

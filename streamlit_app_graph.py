@@ -2,8 +2,9 @@ import uuid
 import streamlit as st
 from langchain_core.messages import HumanMessage
 from langgraph.types import Command
+from langfuse import Langfuse
 
-# Graph APIバージョンのエージェントをインポート
+# agents_graph.pyからエージェントをインポート
 from agents_graph import agent_graph
 
 # 環境変数のロード
@@ -20,6 +21,8 @@ def init_session_state():
         st.session_state.final_result = None
     if "thread_id" not in st.session_state:
         st.session_state.thread_id = None
+    if "trace_id" not in st.session_state:
+        st.session_state.trace_id = None
 
 def reset_session():
     """セッション状態をリセットする"""
@@ -27,43 +30,66 @@ def reset_session():
     st.session_state.waiting_for_approval = False
     st.session_state.final_result = None
     st.session_state.thread_id = None
+    st.session_state.trace_id = None
 
 # セッション状態の初期化を実行
 init_session_state()
 
 def run_agent(input_data):
     """エージェントを実行し、結果を処理する"""
-    # AIエージェント呼び出しに使うconfigurationの作成
-    # LangGraphのinterrupt機能を使うためにthread_idが必要
-    config = {"configurable": 
-        {"thread_id": st.session_state.thread_id}
+    # trace_idがまだなければ、thread_idから生成
+    if not st.session_state.trace_id:
+        st.session_state.trace_id = Langfuse.create_trace_id(seed=st.session_state.thread_id)
+        print(f"[Streamlit] 新しいtrace_idを生成: {st.session_state.trace_id}")
+    
+    # LangfuseのCallbackHandlerを初期化（引数なし）
+    from langfuse.langchain import CallbackHandler
+    langfuse_handler = CallbackHandler()
+    
+    # LangGraphの設定
+    # metadataでsession_id, user_id, tagsを設定してinterruptの前後をつなげる
+    config = {
+        "configurable": {"thread_id": st.session_state.thread_id},
+        "callbacks": [langfuse_handler],
+        "metadata": {
+            "langfuse_session_id": st.session_state.thread_id,  # interruptの前後で同じsession_id
+            "langfuse_tags": ["graph-api", "with-interrupt"]
+        }
     }
+    
+    # input_dataがCommandの場合はそのまま、それ以外はstateとして渡す
+    if isinstance(input_data, Command):
+        stream_input = input_data
+    else:
+        # input_dataは既に[HumanMessage(...)]のリストなので、messagesキーで渡す
+        # trace_idもstateに含める
+        stream_input = {
+            "messages": input_data,  # これは[HumanMessage(...)]のリスト
+            "trace_id": st.session_state.trace_id
+        }
+    
+    print(f"[Streamlit] trace_id: {st.session_state.trace_id}")
+    print(f"[Streamlit] session_id: {st.session_state.thread_id}")
     
     # 結果を処理
     with st.spinner("処理中...", show_time=True):
-        # Graph APIのstream メソッドを使用
-        for event in agent_graph.stream(input_data, config=config, stream_mode="updates"):
-            print(f"[Stream Event] {event.keys()}")
-            
-            # interruptの場合
-            if "__interrupt__" in event:
-                interrupt_data = event["__interrupt__"][0]
-                st.session_state.tool_info = interrupt_data.value
-                st.session_state.waiting_for_approval = True
-                break
-            
-            # agentノードの更新
-            elif "agent" in event:
-                agent_messages = event["agent"].get("messages", [])
-                for msg in agent_messages:
-                    # AIメッセージでツール呼び出しがない場合は最終回答
-                    if hasattr(msg, "content") and isinstance(msg.content, str):
-                        if not hasattr(msg, "tool_calls") or not msg.tool_calls:
-                            st.session_state.final_result = msg.content
-            
-            # toolsノードの更新
-            elif "tools" in event:
-                st.session_state.messages.append({"role": "assistant", "content": "ツールを実行！"})
+        for event in agent_graph.stream(stream_input, config=config, stream_mode="updates"):
+            for node_name, node_output in event.items():
+                print(f"[Streamlit] イベント受信: {node_name}")
+                
+                # interruptの場合
+                if node_name == "__interrupt__":
+                    st.session_state.tool_info = node_output[0].value
+                    st.session_state.waiting_for_approval = True
+                
+                # agentノードからの出力
+                elif node_name == "agent":
+                    # 最後のメッセージを取得
+                    if "messages" in node_output and node_output["messages"]:
+                        last_msg = node_output["messages"][-1]
+                        # ツール呼び出しがない場合は最終結果として扱う
+                        if hasattr(last_msg, 'content') and not getattr(last_msg, 'tool_calls', None):
+                            st.session_state.final_result = last_msg.content
         
         st.rerun()
 
@@ -128,8 +154,8 @@ def app():
             
             # エージェントを実行
             message = HumanMessage(content=user_input, id=st.session_state.thread_id)
-            input_data = {"messages": [message]}
-            if run_agent(input_data):
+            # run_agentにはメッセージのリストを渡す
+            if run_agent([message]):
                 st.rerun()
     else:
         st.info("ツールの承認待ちです。上記のボタンで応答してください。")
