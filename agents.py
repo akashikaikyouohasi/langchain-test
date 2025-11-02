@@ -13,6 +13,7 @@ from langgraph.types import interrupt
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.func import entrypoint, task
 from langgraph.graph import add_messages
+from langfuse.langchain import CallbackHandler
 
 # 環境変数のロード
 from dotenv import load_dotenv
@@ -65,8 +66,10 @@ system_prompt = """
 # LLMを呼び出すタスク
 @task
 def invoke_llm(messages: list[BaseMessage]) -> AIMessage:
+    langfuse_handler = CallbackHandler()
     response = llm_with_tools.invoke(
-        [SystemMessage(content=system_prompt)] + messages
+        [SystemMessage(content=system_prompt)] + messages,
+        config={"callbacks": [langfuse_handler]}
     )
     return response
 
