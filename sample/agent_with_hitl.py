@@ -46,8 +46,29 @@ def get_current_info(topic: str) -> str:
     return f"'{topic}'についての現在の情報: これはサンプル情報です。"
 
 
+@tool
+def submit_final_answer(
+    summary: str,
+    findings: list[str],
+    calculations: dict[str, float],
+    confidence: float,
+    sources: list[str]
+) -> str:
+    """
+    タスクが完了したら、この関数を呼び出して最終回答を提出してください。
+    
+    Args:
+        summary: タスクの要約
+        findings: 発見した重要な情報のリスト
+        calculations: 実行した計算とその結果の辞書
+        confidence: 回答の信頼度（0.0-1.0）
+        sources: 使用した情報源のリスト
+    """
+    return "最終回答を受け付けました。"
+
+
 # ツールのリスト
-tools = [search_web, calculator, get_current_info]
+tools = [search_web, calculator, get_current_info, submit_final_answer]
 
 
 # ========== 構造化された出力の定義 ==========
@@ -86,9 +107,29 @@ def agent_node(state: AgentState) -> dict:
         model_id=os.getenv("AWS_BEDROCK_MODEL", "anthropic.claude-3-5-sonnet-20241022-v2:0"),
         model_kwargs={"temperature": 0}
     )
-    llm_with_tools = llm.bind_tools(tools)
     
     messages = state["messages"]
+    
+    # システムプロンプトを追加（最初のメッセージがSystemMessageでない場合）
+    if not messages or not isinstance(messages[0], BaseMessage) or messages[0].type != "system":
+        system_prompt = HumanMessage(
+            content="""あなたは有能なAIアシスタントです。利用可能なツールを使ってユーザーのタスクを完了してください。
+
+重要な指示：
+1. 必要に応じてツール（search_web, calculator, get_current_info）を使用してください
+2. タスクが完了したら、必ず submit_final_answer ツールを呼び出して最終回答を提出してください
+3. submit_final_answer では以下の情報を含めてください：
+   - summary: タスクの要約
+   - findings: 発見した重要な情報のリスト
+   - calculations: 実行した計算結果（辞書形式）
+   - confidence: 回答の信頼度（0.0-1.0）
+   - sources: 使用した情報源のリスト
+
+例：
+- ユーザーが計算を依頼 → calculator ツール使用 → submit_final_answer で結果を報告
+- ユーザーが情報検索を依頼 → search_web ツール使用 → submit_final_answer で結果を報告"""
+        )
+        messages = [system_prompt] + list(messages)
     
     # 入力プロンプトをログ出力
     print("\n" + "="*50)
@@ -98,13 +139,15 @@ def agent_node(state: AgentState) -> dict:
         msg_type = type(msg).__name__
         print(f"\n[メッセージ {i}] {msg_type}")
         if hasattr(msg, "content") and msg.content:
-            print(f"Content: {msg.content}")
+            content_preview = msg.content[:150] + "..." if len(msg.content) > 150 else msg.content
+            print(f"Content: {content_preview}")
         if hasattr(msg, "tool_calls") and msg.tool_calls:
             print(f"Tool Calls: {msg.tool_calls}")
         if isinstance(msg, ToolMessage):
             print(f"Tool Call ID: {msg.tool_call_id}")
     
-    # LLMを呼び出し
+    # LLMにツール呼び出しを判断させる
+    llm_with_tools = llm.bind_tools(tools)
     response = llm_with_tools.invoke(messages)
     
     # 出力プロンプトをログ出力
@@ -120,26 +163,67 @@ def agent_node(state: AgentState) -> dict:
             print(f"  - ツール: {tc['name']}")
             print(f"    引数: {tc['args']}")
             print(f"    ID: {tc['id']}")
+            
+            # submit_final_answerが呼ばれた場合、構造化出力を生成
+            if tc['name'] == 'submit_final_answer':
+                print("\n🎯 submit_final_answer検出 → 構造化出力を生成します")
+                args = tc['args']
+                final_answer = FinalAnswer(
+                    summary=args.get('summary', ''),
+                    findings=args.get('findings', []),
+                    calculations=args.get('calculations', {}),
+                    confidence=args.get('confidence', 1.0),
+                    sources=args.get('sources', [])
+                )
+                
+                print("\n" + "="*50)
+                print("🤖 Agent Node - 構造化出力")
+                print("="*50)
+                print(f"型: {type(final_answer).__name__}")
+                print(f"\n要約: {final_answer.summary}")
+                print(f"\n発見事項 ({len(final_answer.findings)}件):")
+                for i, finding in enumerate(final_answer.findings, 1):
+                    print(f"  {i}. {finding}")
+                print(f"\n計算結果: {final_answer.calculations}")
+                print(f"信頼度: {final_answer.confidence}")
+                print(f"情報源: {final_answer.sources}")
+                print("="*50 + "\n")
+                
+                return {
+                    "messages": [response],
+                    "final_answer": final_answer
+                }
+    
     print("="*50 + "\n")
     
     return {"messages": [response]}
 
 
-def should_continue(state: AgentState) -> Literal["tools", "human_review", "finalize"]:
+def should_continue(state: AgentState) -> Literal["tools", "human_review", "end"]:
     """次に進むべきノードを決定"""
+    # すでに最終回答が生成されている場合は終了
+    if state.get("final_answer"):
+        return "end"
+    
     messages = state["messages"]
     last_message = messages[-1]
     
     # ツール呼び出しがある場合
     if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-        # 重要な操作（例: calculator）の場合は人間のレビューを要求
         tool_names = [tc["name"] for tc in last_message.tool_calls]
+        
+        # submit_final_answerが呼ばれた場合は終了（構造化出力済み）
+        if "submit_final_answer" in tool_names:
+            return "end"
+        
+        # 重要な操作（例: calculator）の場合は人間のレビューを要求
         if "calculator" in tool_names:
             return "human_review"
+        
         return "tools"
     
-    # ツール呼び出しがない場合は最終化
-    return "finalize"
+    # ツール呼び出しがない場合は終了
+    return "end"
 
 
 def human_review_node(state: AgentState) -> dict:
@@ -189,63 +273,63 @@ def human_review_node(state: AgentState) -> dict:
         }
 
 
-def finalize_node(state: AgentState) -> dict:
-    """最終的な構造化された出力を生成"""
-    llm = ChatBedrock(
-        model_id=os.getenv("AWS_BEDROCK_MODEL", "anthropic.claude-3-5-sonnet-20241022-v2:0"),
-        model_kwargs={"temperature": 0}
-    )
+# def finalize_node(state: AgentState) -> dict:
+#     """最終的な構造化された出力を生成"""
+#     llm = ChatBedrock(
+#         model_id=os.getenv("AWS_BEDROCK_MODEL", "anthropic.claude-3-5-sonnet-20241022-v2:0"),
+#         model_kwargs={"temperature": 0}
+#     )
     
-    # Pydanticモデルで構造化された出力を生成
-    structured_llm = llm.with_structured_output(FinalAnswer)
+#     # Pydanticモデルで構造化された出力を生成
+#     structured_llm = llm.with_structured_output(FinalAnswer)
     
-    # 会話履歴から最終回答を生成
-    messages = state["messages"]
-    final_prompt = HumanMessage(
-        content="これまでの会話内容を基に、構造化された最終回答を生成してください。"
-    )
+#     # 会話履歴から最終回答を生成
+#     messages = state["messages"]
+#     final_prompt = HumanMessage(
+#         content="これまでの会話内容を基に、構造化された最終回答を生成してください。"
+#     )
     
-    # 入力プロンプトをログ出力
-    print("\n" + "="*50)
-    print("📝 Finalize Node - 入力プロンプト")
-    print("="*50)
-    print(f"メッセージ履歴: {len(messages)}件")
-    for i, msg in enumerate(messages, 1):
-        msg_type = type(msg).__name__
-        print(f"\n[メッセージ {i}] {msg_type}")
-        if hasattr(msg, "content") and msg.content:
-            content_preview = msg.content[:100] + "..." if len(msg.content) > 100 else msg.content
-            print(f"Content: {content_preview}")
-        if hasattr(msg, "tool_calls") and msg.tool_calls:
-            print(f"Tool Calls: {len(msg.tool_calls)}件")
-        if isinstance(msg, ToolMessage):
-            print(f"Tool Call ID: {msg.tool_call_id}")
+#     # 入力プロンプトをログ出力
+#     print("\n" + "="*50)
+#     print("📝 Finalize Node - 入力プロンプト")
+#     print("="*50)
+#     print(f"メッセージ履歴: {len(messages)}件")
+#     for i, msg in enumerate(messages, 1):
+#         msg_type = type(msg).__name__
+#         print(f"\n[メッセージ {i}] {msg_type}")
+#         if hasattr(msg, "content") and msg.content:
+#             content_preview = msg.content[:100] + "..." if len(msg.content) > 100 else msg.content
+#             print(f"Content: {content_preview}")
+#         if hasattr(msg, "tool_calls") and msg.tool_calls:
+#             print(f"Tool Calls: {len(msg.tool_calls)}件")
+#         if isinstance(msg, ToolMessage):
+#             print(f"Tool Call ID: {msg.tool_call_id}")
     
-    print(f"\n[追加プロンプト] {type(final_prompt).__name__}")
-    print(f"Content: {final_prompt.content}")
-    print("="*50)
+#     print(f"\n[追加プロンプト] {type(final_prompt).__name__}")
+#     print(f"Content: {final_prompt.content}")
+#     print("="*50)
     
-    # LLMを呼び出し
-    final_answer = structured_llm.invoke(list(messages) + [final_prompt])
+#     # LLMを呼び出し
+#     final_answer = structured_llm.invoke(list(messages) + [final_prompt])
     
-    # 出力プロンプト（構造化された結果）をログ出力
-    print("\n" + "="*50)
-    print("📝 Finalize Node - 出力プロンプト（構造化された結果）")
-    print("="*50)
-    print(f"型: {type(final_answer).__name__}")
-    print(f"\n要約: {final_answer.summary}")
-    print(f"\n発見事項 ({len(final_answer.findings)}件):")
-    for i, finding in enumerate(final_answer.findings, 1):
-        print(f"  {i}. {finding}")
-    print(f"\n計算結果: {final_answer.calculations}")
-    print(f"信頼度: {final_answer.confidence}")
-    print(f"情報源: {final_answer.sources}")
-    print("="*50 + "\n")
+#     # 出力プロンプト（構造化された結果）をログ出力
+#     print("\n" + "="*50)
+#     print("📝 Finalize Node - 出力プロンプト（構造化された結果）")
+#     print("="*50)
+#     print(f"型: {type(final_answer).__name__}")
+#     print(f"\n要約: {final_answer.summary}")
+#     print(f"\n発見事項 ({len(final_answer.findings)}件):")
+#     for i, finding in enumerate(final_answer.findings, 1):
+#         print(f"  {i}. {finding}")
+#     print(f"\n計算結果: {final_answer.calculations}")
+#     print(f"信頼度: {final_answer.confidence}")
+#     print(f"情報源: {final_answer.sources}")
+#     print("="*50 + "\n")
     
-    return {
-        "final_answer": final_answer,
-        "messages": [AIMessage(content="最終回答を生成しました。")]
-    }
+#     return {
+#         "final_answer": final_answer,
+#         "messages": [AIMessage(content="最終回答を生成しました。")]
+#     }
 
 
 # ========== グラフの構築 ==========
@@ -262,7 +346,7 @@ def create_agent_graph():
     workflow.add_node("agent", agent_node)
     workflow.add_node("tools", tool_node)
     workflow.add_node("human_review", human_review_node)
-    workflow.add_node("finalize", finalize_node)
+    # finalize_nodeは削除（agent_nodeで直接構造化出力）
     
     # エントリーポイントを設定
     workflow.set_entry_point("agent")
@@ -274,7 +358,7 @@ def create_agent_graph():
         {
             "tools": "tools",
             "human_review": "human_review",
-            "finalize": "finalize"
+            "end": END
         }
     )
     
@@ -301,9 +385,6 @@ def create_agent_graph():
     
     # ツール実行後はエージェントに戻る
     workflow.add_edge("tools", "agent")
-    
-    # 最終化後は終了
-    workflow.add_edge("finalize", END)
     
     # メモリを追加（会話の状態を保持）
     memory = MemorySaver()
