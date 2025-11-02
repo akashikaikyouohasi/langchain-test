@@ -1,16 +1,17 @@
-.PHONY: help install run-agent run-streamlit test clean lint format
+.PHONY: help install run-agent run-streamlit run-streamlit-graph test clean lint format
 
 # デフォルトターゲット
 help:
 	@echo "利用可能なコマンド:"
-	@echo "  make install        - 仮想環境を作成して依存パッケージをインストール"
-	@echo "  make run-agent      - agent_with_hitl.py を実行"
-	@echo "  make run-streamlit  - Streamlit アプリを起動"
-	@echo "  make test           - テストを実行"
-	@echo "  make lint           - コードの静的解析（Pylint）"
-	@echo "  make format         - コードのフォーマット（Black）"
-	@echo "  make clean          - 仮想環境とキャッシュを削除"
-	@echo "  make activate       - 仮想環境のアクティベート方法を表示"
+	@echo "  make install             - 仮想環境を作成して依存パッケージをインストール"
+	@echo "  make run-agent           - agent_with_hitl.py を実行"
+	@echo "  make run-streamlit       - Streamlit アプリを起動 (func API版)"
+	@echo "  make run-streamlit-graph - Streamlit アプリを起動 (Graph API版)"
+	@echo "  make test                - テストを実行"
+	@echo "  make lint                - コードの静的解析（Pylint）"
+	@echo "  make format              - コードのフォーマット（Black）"
+	@echo "  make clean               - 仮想環境とキャッシュを削除"
+	@echo "  make activate            - 仮想環境のアクティベート方法を表示"
 
 # 仮想環境の作成とパッケージインストール（uv使用）
 install:
@@ -26,10 +27,15 @@ run-agent:
 	@echo "🤖 エージェントを起動中..."
 	uv run python agent_with_hitl.py
 
-# Streamlit アプリを起動
+# Streamlit アプリを起動 (func API版)
 run-streamlit:
-	@echo "🚀 Streamlit アプリを起動中..."
+	@echo "🚀 Streamlit アプリを起動中 (func API版)..."
 	uv run streamlit run streamlit_app.py
+
+# Streamlit アプリを起動 (Graph API版)
+run-streamlit-graph:
+	@echo "🚀 Streamlit アプリを起動中 (Graph API版)..."
+	uv run streamlit run streamlit_app_graph.py
 
 # agents.py を使ったアプリを起動
 run-agents:
@@ -108,5 +114,10 @@ freeze:
 
 # 開発用サーバーの起動（Streamlit + ホットリロード）
 dev:
-	@echo "🔥 開発モードで起動中（ホットリロード有効）..."
+	@echo "🔥 開発モードで起動中（ホットリロード有効・func API版）..."
 	uv run streamlit run streamlit_app.py --server.runOnSave=true
+
+# 開発用サーバーの起動（Graph API版）
+dev-graph:
+	@echo "🔥 開発モードで起動中（ホットリロード有効・Graph API版）..."
+	uv run streamlit run streamlit_app_graph.py --server.runOnSave=true
